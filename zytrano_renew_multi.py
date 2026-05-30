@@ -1,9 +1,6 @@
 """
-Zytrano.top 自动续期脚本 (高可用无人值守投产版)
-- 实现了账号级别的异常防熔断机制，某个账号崩溃不影响后续队列
-- 建立了全局绝对可靠的 try-finally 浏览器进程回收屏障
-- 修复了 JS 参数化传递与前置探针检查，解决注入隐患与虚假调用
-- 引入了解盾状态级强干预，拒绝盲目提交表单
+Zytrano.top 自动续期脚本 (高可用多账号无人值守版)
+文件名: zytrano_renew_multi.py
 """
 
 import json
@@ -26,7 +23,7 @@ def mask(value: str, show: int = 3) -> str:
         return "***"
     return value[:show] + "***" + value[-show:]
 
-# ── 环境变量与基础配置 ──────────────────────────────────────
+# ── 基础配置 ──────────────────────────────────────────────
 WXPUSHER_TOKEN = os.environ.get("WXPUSHER_TOKEN", "")
 WXPUSHER_UID   = os.environ.get("WXPUSHER_UID", "")
 
@@ -96,7 +93,7 @@ def load_accounts() -> list[dict]:
         raise ValueError(f"❌ 账号配置树深度解析崩溃 ({source_info}): {e}")
 
 
-# ── 工具函数 ──────────────────────────────────────────────
+# ── 辅助核心工具 ──────────────────────────────────────────
 def take_screenshot(page, name: str):
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -113,7 +110,6 @@ def human_delay(min_s=0.5, max_s=1.2):
     time.sleep(random.uniform(min_s, max_s))
 
 def js_eval(page, script: str, *args):
-    """ 支持强类型参数化安全传递的评估器 """
     try: return page.evaluate(script, *args)
     except Exception: return None
 
@@ -157,7 +153,6 @@ def navigate(page, url: str, timeout=45) -> bool:
     return wait_cf_pass(page, timeout=30)
 
 def click_turnstile_checkbox(page, timeout=30) -> bool:
-    """ 完整还原 page.frames 扫描与真实 CDP 坐标物理点击的闭环实现 """
     def token_ready() -> bool:
         val = js_eval(page, """
             (() => {
@@ -228,7 +223,7 @@ def click_turnstile_checkbox(page, timeout=30) -> bool:
     return False
 
 
-# ── 登录流 (修复群体硬伤5：强校验解盾状态，未过直接熔断阻断) ──────────
+# ── 登录流 (已修复：精确定位带占位符的输入框，防止 hidden 阻断) ──
 LOGGED_IN_URL_KEYS = ("/home", "/dashboard", "/servers")
 
 def is_logged_in_page(page) -> bool:
@@ -244,6 +239,7 @@ def login(page, account: dict) -> bool:
         if is_logged_in_page(page): return True
 
         try:
+            # 🌟 修复点 1：精准等待带占位符的可视输入框，彻底避开 <input type="hidden"> 坑
             page.wait_for_selector('input[placeholder]', timeout=8000)
             human_delay(0.5, 1.0)
 
@@ -263,10 +259,9 @@ def login(page, account: dict) -> bool:
 
             human_delay(0.5, 1.0)
 
-            # 【修复硬伤5】强审计 Turnstile 结果，解盾失败直接熔断本次，拒绝盲目提交
             cf_passed = click_turnstile_checkbox(page)
             if not cf_passed:
-                log.error(f"❌ [账号: {mask(username)}] 本轮 Turnstile 盾面未能在时限内通过，放弃提交表单触发重试。")
+                log.error(f"❌ [账号: {mask(username)}] 本轮 Turnstile 未通过，放弃提交表单触发重试。")
                 take_screenshot(page, f"login_cf_failed_{username[:4]}")
                 continue 
 
@@ -322,7 +317,7 @@ def click_confirm_modal_if_exists(page) -> bool:
     return False
 
 
-# ── 单个账号核心闭环 (修复群体硬伤3、4：前置探针校验、参数化 JS、安全传参) ──
+# ── 单个账号核心闭环 (已修复：采用拟人化物理按钮点击，避开 window 函数找不到的硬阻断) ──
 def run_for_account(page, account: dict) -> str:
     username = account["username"]
     if not login(page, account):
@@ -340,36 +335,29 @@ def run_for_account(page, account: dict) -> str:
         
         log.info(f"⏳ 容器 [{s['name']}] 续期前解析天数: {old_days:.4f} 天 ({old_time_str})")
         
-        # 【修复硬伤3】前置探针检查：确认 window.handleServerRenew 挂载就绪
-
-            # 直接使用 Playwright 物理定位包含 handleServerRenew('ID') 的原生按钮，100% 绕过全局函数限制
+        # 🌟 修复点 2：改用拟人化 DOM 物理点击，100% 绕过打包工具导致的全局 window.handleServerRenew 找不到问题
         try:
-            # 寻找页面上带有对应 target_id 续期属性的按钮或链接并点击
             renew_btn = page.locator(f"*[onclick*='{target_id}']").first
             if renew_btn.is_visible():
                 renew_btn.click(timeout=5000)
                 log.info(f"-> 成功通过 DOM 物理点击触发容器 [{s['name']}] 的续期弹窗")
             else:
-                # 如果 onclick 不在当前层，尝试降级点击当前服务器索引行的常规 Renew 按钮
                 log.warning(f"⚠️ 未找到精准 ID 按钮，尝试通过行索引 [{s['index']}] 模拟点击")
                 page.get_by_role("button", name=re.compile("Renew", re.I)).nth(s['index']).click(timeout=5000)
         except Exception as e:
             log.error(f"❌ 触发续期点击交互时发生异常: {e}")
             results.append({"name": s["name"], "success": False, "time_str": old_time_str, "err_msg": "点击触发失败"})
             continue
-            
 
         time.sleep(2)
         click_confirm_modal_if_exists(page)
         
-        # 冷却并刷新主域
         time.sleep(3)
         navigate(page, SERVERS_URL)
         time.sleep(2)
         
         updated_list = get_servers_info(page)
         
-        # 优选 ID，次选 index 精准比对
         matched_server = None
         for us in updated_list:
             if us["server_id"] == target_id:
@@ -379,7 +367,7 @@ def run_for_account(page, account: dict) -> str:
         if not matched_server:
             for us in updated_list:
                 if us["index"] == s["index"]:
-                    log.warning(f"⚠️ 服务器 ID 无法完成闭环匹配，降级采用自然索引 [{s['index']}] 兜底")
+                    log.warning(f"⚠️ 服务器 ID 无法闭环匹配，降级采用自然索引 [{s['index']}] 兜底")
                     matched_server = us
                     break
 
@@ -387,7 +375,7 @@ def run_for_account(page, account: dict) -> str:
         new_days = parse_days_remaining(new_time_str)
         log.info(f"⏳ 容器 [{s['name']}] 续期后解析天数: {new_days:.4f} 天 ({new_time_str})")
 
-        # 严格浮点增量断言，防止假成功
+        # 严格浮点增量断言 (增加超过 0.5 天才算成功)
         is_real_success = (new_days > (old_days + 0.5))
 
         results.append({
@@ -404,7 +392,7 @@ def run_for_account(page, account: dict) -> str:
     return "\n".join(lines)
 
 
-# ── 全局多账号总线控制 (修复群体硬伤1、2：加入账号防熔断、全局进程僵尸防御) ──
+# ── 全局总线控制 (强防熔断、强释放机制) ─────────────────────────
 def main():
     from cloakbrowser import launch
 
@@ -420,13 +408,12 @@ def main():
     log.info("🚀 启动 CloakBrowser 生产主实例进程...")
     browser = launch(headless=False, humanize=True, geoip=True)
 
-    # 【修复硬伤2】提升至最外围的全局坚固资源回收框架，无死角防僵尸残留
     try:
         for idx, account in enumerate(accounts, 1):
             username = account.get("username", "未知")
             log.info(f"\n{'='*20} 进程区间: 账号流水轴 ({idx} / {len(accounts)}) {'='*20}")
             
-            # --- 【修复硬伤1】账号级彻底防熔断沙箱 ---
+            # 账号级沙箱防熔断
             try:
                 context = None
                 page = None
@@ -435,16 +422,14 @@ def main():
                     page = context.new_page()
                     log.info("🔒 成功挂载标准独立 Sandbox BrowserContext。")
                 except Exception as err:
-                    log.warning(f"⚠️ 无法分离沙盒 Context: {err}。执行进程级彻底重启...")
+                    log.warning(f"⚠️ 无法分离沙盒 Context: {err}。执行进程级重启...")
                     try: browser.close()
                     except Exception: pass
                     
-                    # 物理隔离重拉起
                     browser = launch(headless=False, humanize=True, geoip=True)
                     page = browser.new_page()
                     log.info("🔒 物理层重置就绪，在全新独立浏览器进程空间中运行。")
 
-                # 执行核心闭环逻辑
                 account_report = run_for_account(page, account)
                 all_reports.append(account_report)
                 all_reports.append("")
@@ -453,13 +438,11 @@ def main():
                     has_any_error = True
 
             except Exception as account_level_err:
-                # 核心防熔断捕获点：一旦当前账号执行中网页关闭、闪退、DOM异常，被此完全阻断
-                log.error(f"💥 [严重异常] 账号 [{mask(username)}] 执行中遭遇未捕获突发崩溃: {account_level_err}", exc_info=True)
+                log.error(f"💥 [严重异常] 账号 [{mask(username)}] 执行遭遇未捕获突发崩溃: {account_level_err}", exc_info=True)
                 all_reports.append(f"👤 账号: {mask(username)}\n  ❌ 运行期突发全面崩溃 (已沙箱隔离) -> 错误原因: {account_level_err}\n")
                 has_any_error = True
                 
             finally:
-                # 局部资源尽力释放
                 if 'page' in locals() and page:
                     try: page.close()
                     except Exception: pass
@@ -467,7 +450,6 @@ def main():
                     try: context.close()
                     except Exception: pass
 
-            # 步进随机延迟
             if idx < len(accounts):
                 gap = random.randint(6, 12)
                 log.info(f"🛡️ 规避批量指纹审计，挂起睡眠 {gap} 秒...")
@@ -477,23 +459,20 @@ def main():
         log.critical(f"🚨 全局总线级发生灾难性故障: {global_err}", exc_info=True)
         has_any_error = True
     finally:
-        # 【修复硬伤2】无死角绝对回收屏障：无论是跑完还是中途被大范围报错打断，一定会干净关闭
-        log.info("🧹 触发全局生命周期终点销毁机制，正在强制注销并闭合 Chromium 物理进程...")
+        log.info("🧹 触发全局生命周期终点销毁机制，正在回收进程...")
         try:
             browser.close()
         except Exception as close_err:
             log.error(f"回收内核进程时发生次生故障: {close_err}")
         log.info("所有多账号浏览器执行矩阵注销完毕。")
 
-    # 推送合并简报
     final_msg = "\n".join(all_reports).strip()
     log.info(f"\n输出最终统计报表:\n{final_msg}")
     
-    # 微信合并推送
     if has_any_error:
         wxpush(f"🚨 Zytrano 挂机运维简报-异常或失败审计\n\n{final_msg}")
     else:
-        log.info("🎉 完美大满贯！所有账号及名下服务器全量实质性增量续期完毕。保持静默，不干扰日常生活。")
+        log.info("🎉 完美大满贯！所有账号均已实质性增量续期完毕。保持静默。")
 
 
 def wxpush(content: str):
