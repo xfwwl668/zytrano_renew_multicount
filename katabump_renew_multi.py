@@ -36,6 +36,7 @@ BASE_URL = "https://dashboard.katabump.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 SERVERS_URL = f"{BASE_URL}/servers"
 DEFAULT_SERVER_IDS = ["303320"]
+SCRIPT_VERSION = "katabump-renew-20260605-modal-strict-v3"
 
 SCREENSHOT_DIR = Path("./katabump_screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
@@ -464,7 +465,7 @@ def probe_renew_modal(page) -> dict:
             };
 
             const standardRoots = Array.from(document.querySelectorAll(
-                '.modal.show, .modal[aria-modal="true"], .modal[style*="display: block"], .modal-content, .modal-dialog, [role="dialog"], .swal2-popup, .offcanvas.show'
+                '.modal.show, .modal[aria-modal="true"], .modal[style*="display: block"], .modal-content, .modal-dialog, [role="dialog"], .swal2-popup, .offcanvas.show, .modal, .modal-backdrop + *'
             ));
             const broadRoots = Array.from(document.querySelectorAll('div, section, article, form'));
             const seen = new Set();
@@ -474,7 +475,6 @@ def probe_renew_modal(page) -> dict:
                     seen.add(el);
                     const rect = el.getBoundingClientRect();
                     if (rect.width < 260 || rect.height < 130) return false;
-                    if (rect.width > window.innerWidth * 0.92 || rect.height > window.innerHeight * 0.92) return false;
                     const text = textOf(el);
                     if (/delete\s+server|terminate|destroy|remove|wipe|suspend/i.test(text)) return false;
                     const hasRenew = /\brenew\b/i.test(text);
@@ -486,14 +486,30 @@ def probe_renew_modal(page) -> dict:
                 .map((el) => {
                     const rect = rectInfo(el);
                     const text = textOf(el);
-                    const modalLike = /modal|dialog|swal|offcanvas/i.test(String(el.className || '') + ' ' + String(el.getAttribute('role') || '')) ? 1 : 0;
-                    return { el, rect, text, score: modalLike * 1000 - rect.area / 1000 };
+                    const marker = String(el.className || '') + ' ' + String(el.getAttribute('role') || '') + ' ' + String(el.id || '');
+                    const modalLike = /modal|dialog|swal|offcanvas/i.test(marker) ? 1 : 0;
+                    const exactText = /this\s+will\s+extend\s+the\s+life\s+of\s+your\s+server/i.test(text) ? 1 : 0;
+                    const captchaText = /captcha|altcha|verified|protected\s+by/i.test(text) ? 1 : 0;
+                    const fullScreenPenalty = (rect.width > window.innerWidth * 0.92 || rect.height > window.innerHeight * 0.92) ? 120 : 0;
+                    return { el, rect, text, score: modalLike * 1200 + exactText * 900 + captchaText * 500 - fullScreenPenalty - rect.area / 5000 };
                 })
                 .sort((a, b) => b.score - a.score || a.rect.area - b.rect.area);
 
             const rootItem = roots[0];
             if (!rootItem) {
-                return { found: false, reason: 'renew_modal_not_found' };
+                const visibleButtons = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"], a'))
+                    .filter(visible)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        return { text: textOf(el), cls: String(el.className || '').slice(0, 120), x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+                    })
+                    .filter((item) => item.text)
+                    .slice(0, 30);
+                const modalish = Array.from(document.querySelectorAll('.modal, .modal-content, .modal-dialog, [role="dialog"], [class*="modal"], [class*="dialog"], [class*="captcha"], [class*="altcha"]'))
+                    .filter(visible)
+                    .map((el) => ({ tag: el.tagName, cls: String(el.className || '').slice(0, 120), text: textOf(el).slice(0, 260) }))
+                    .slice(0, 12);
+                return { found: false, reason: 'renew_modal_not_found', visibleButtons, modalish, bodyText: textOf(document.body).slice(0, 500) };
             }
 
             const root = rootItem.el;
@@ -691,6 +707,71 @@ def find_renew_button_probe(page) -> dict:
     """) or {"found": False}
 
 
+def trigger_renew_button_by_dom(page) -> dict:
+    """用 DOM 事件触发页面上的第一个 Renew，作为物理坐标点击失败后的重试。"""
+    return js_eval(page, r"""
+        () => {
+            const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return st && st.display !== 'none' && st.visibility !== 'hidden'
+                    && Number(st.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+            };
+            const textOf = (el) => normalize(
+                el.innerText || el.value || el.getAttribute('aria-label') ||
+                el.getAttribute('title') || el.textContent || ''
+            );
+            const rejectRe = /close|cancel|delete|remove|terminate|destroy|suspend|stop|restart|reinstall|reset|wipe|archive/i;
+            const modalRe = /modal|dialog|swal|offcanvas/i;
+            const inModal = (el) => Boolean(el.closest('.modal, .modal-content, .modal-dialog, [role="dialog"], .swal2-popup, .offcanvas'));
+            const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+                .filter(visible)
+                .filter((el) => !inModal(el))
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const text = textOf(el);
+                    const attrs = normalize([
+                        el.getAttribute('class'), el.getAttribute('onclick'), el.getAttribute('href'),
+                        el.getAttribute('data-bs-toggle'), el.getAttribute('data-bs-target'), el.getAttribute('data-target'),
+                        el.getAttribute('formaction')
+                    ].filter(Boolean).join(' '));
+                    let score = 0;
+                    if (/^\s*renew\s*$/i.test(text)) score += 100;
+                    if (/renew/i.test(attrs)) score += 40;
+                    if (modalRe.test(attrs)) score += 30;
+                    if (rect.top > window.innerHeight * 0.35) score += 10;
+                    return { el, text, attrs, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, score };
+                })
+                .filter((item) => /\brenew\b/i.test(`${item.text} ${item.attrs}`) && !rejectRe.test(`${item.text} ${item.attrs}`))
+                .sort((a, b) => b.score - a.score || b.y - a.y);
+            const target = candidates[0];
+            if (!target) {
+                return { clicked: false, candidates: candidates.map((item) => ({ text: item.text, attrs: item.attrs, score: item.score })) };
+            }
+            target.el.scrollIntoView({ block: 'center', inline: 'center' });
+            target.el.focus && target.el.focus();
+            target.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
+            target.el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            target.el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            target.el.click();
+            return { clicked: true, text: target.text, attrs: target.attrs, x: Math.round(target.x), y: Math.round(target.y), score: target.score };
+        }
+    """) or {"clicked": False}
+
+
+def wait_for_renew_modal(page, timeout: int = 6) -> dict:
+    deadline = time.time() + timeout
+    last_probe = None
+    while time.time() < deadline:
+        last_probe = probe_renew_modal(page)
+        if isinstance(last_probe, dict) and last_probe.get("found"):
+            return last_probe
+        time.sleep(0.4)
+    return last_probe or {"found": False, "reason": "modal_wait_timeout"}
+
+
 def click_renew_button(page, target_url: str) -> tuple[bool, str]:
     probe = find_renew_button_probe(page)
     if isinstance(probe, dict) and probe.get("found"):
@@ -701,7 +782,27 @@ def click_renew_button(page, target_url: str) -> tuple[bool, str]:
             page.mouse.click(x, y)
             detail = f"text='{probe.get('text')}', attrs='{probe.get('attrs')}', score={probe.get('score')}"
             log.info(f"-> KataBump 续期按钮已点击: {detail}")
-            return True, detail
+            modal_probe = wait_for_renew_modal(page, timeout=6)
+            if isinstance(modal_probe, dict) and modal_probe.get("found"):
+                log.info(
+                    "✅ 第一次 Renew 点击后已确认二次认证模态框出现: "
+                    f"buttons={modal_probe.get('buttons')}, hasCaptcha={modal_probe.get('hasCaptcha')}"
+                )
+                return True, detail
+
+            log.warning(f"⚠️ 坐标点击后未出现 Renew 模态框，准备 DOM 事件重试。最后探测: {modal_probe}")
+            dom_result = trigger_renew_button_by_dom(page)
+            log.info(f"-> KataBump DOM 事件重试触发 Renew: {dom_result}")
+            modal_probe = wait_for_renew_modal(page, timeout=7)
+            if isinstance(modal_probe, dict) and modal_probe.get("found"):
+                log.info(
+                    "✅ DOM 事件重试后已确认二次认证模态框出现: "
+                    f"buttons={modal_probe.get('buttons')}, hasCaptcha={modal_probe.get('hasCaptcha')}"
+                )
+                return True, f"{detail}; DOM 重试={dom_result}"
+
+            take_screenshot(page, f"katabump_first_renew_no_modal_{server_id_from_url(target_url)}")
+            return False, f"第一个 Renew 已点击但二次认证模态框未出现。最后探测: {modal_probe}"
         except Exception as e:
             log.warning(f"⚠️ KataBump 续期按钮坐标点击失败: {e}")
 
@@ -936,6 +1037,8 @@ def wxpush(content: str):
 
 def main():
     from cloakbrowser import launch
+
+    log.info(f"🧩 KataBump renew script version: {SCRIPT_VERSION}")
 
     try:
         accounts = load_accounts()
